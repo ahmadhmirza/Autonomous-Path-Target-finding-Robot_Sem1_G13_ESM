@@ -1,0 +1,654 @@
+
+//::::::::::::::::::::::: About The Project :::::::::::::::::::::
+  /*
+  **
+  **  Author    : Ahmad Hassan Mirza(7104716),Kiran Ravindra Rao (7104715)
+  **  Group No. : 13
+  **  Project   : Introduction to Embedded Systems - DOROBO
+  **  Objective : To detect and approach the target by avoiding the obstacles on the way.
+  **  Language  : C
+  **  Code for  : G13 - Gizmo Rover
+  **
+  */
+
+  /*
+  **  Description:
+  **
+  **  A Rover structure is built coupled with 3 wheels run using dc motors and is equipped with 2 IR Distance measuring sensor units,
+  **  2 switch sensors and 2 IR sensors. This program written in C ensures that the Rover avoids the obstacles and keeps moving. Once
+  **  it detects the target, it tries to approach it while avoiding all obstacles on its way. To achieve this 2 tasks are defined which run
+  **  sequentially on a single core controller by time sharing. One of the tasks named "vDetObs" is to detect and avoid the obstacles.
+  **  This task avoids the obstacle within its threshold vicinity. Another task named "vTarget" is to detect the target and to move towards it.
+  **  This task functions in such a way that it gets suspended when any obstacle is detected in front of the Rover during its approach towards
+  **  the Target. This task resumes when the IR sensors receive the signal from the Target and when there is no obstacle
+  **  in front of the Rover.
+  **
+  */
+
+//::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+//::::::::::::::::::::::: The C Program :::::::::::::::::::::
+
+// Header inclusions
+#include <stdlib.h>
+#include <stdio.h>
+#include "dorobo32.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "trace.h"
+#include "motor.h"
+#include "adc.h"
+#include "stm32f0xx_hal.h"
+#include "task.h"
+#include "queue.h"
+#include "fft.h"
+
+
+//Task declarations
+static void vDetObs(void *pvParameters);
+static void vTarget(void *pvParameters);
+
+//Function declarations
+void Collision();
+void FullStop();
+void Forward();
+void TurnLeft();
+void TurnRight();
+void RampRight();
+void RampLeft();
+void Reverse();
+void ft_get_samples(void);
+void getsample_a();
+void getsample_b();
+void SwitchChk_Obstacle();
+void SwitchChk_Target();
+
+//Variable declarations
+static int FW_Speed = 80;
+static int Turn_Speed = 80;
+static int Sensor_Threshold = 1600;
+
+static uint32_t dSen_l = 0; //variable to store value from left side of distance sensor
+static uint32_t dSen_r = 0; //variable to store value from right side of distance sensor
+
+static uint32_t sample_value_a = 0; //variable to store value from left side of IR sensor
+static uint32_t sample_value_b = 0; //variable to store value from right side of IR sensor
+
+static int mot_status = 0;  //to know the moving direction of the Rover
+// mot_status = 0 : Rover Stationary
+// mot_status = 1 : Rover Turning Left
+// mot_status = 2 : Rover Turning Right
+// mot_status = 3 : Rover Moving Reverse
+// mot_status = 5 : Rover Moving Forward
+
+
+static int corner_avoidance = 0.8; //timing variable to avoid corner stuck condition
+
+static int switch1 = 1; //variable to store value from left side of switch sensor
+static int switch2 = 1; //variable to store value from right side of switch sensor
+
+bool fft_sampling = false; //variable to check if sampling is finished
+
+//Task Handlers
+TaskHandle_t xTargetDetection = NULL;
+TaskHandle_t xObstacleDetection = NULL;
+
+
+//::::::::::::::::::::::: The main function :::::::::::::::::::::
+int main()
+{
+  //Initialization
+    dorobo_init();
+    trace_init();
+    adc_init();
+    digital_init();
+    ft_init();
+
+  //Configure IR sensor pins as input pullup
+    digital_configure_pin(DD_PIN_PE1, DD_CFG_INPUT_PULLUP); //for left side
+    digital_configure_pin(DD_PIN_PE0, DD_CFG_INPUT_PULLUP); //for right side
+
+  //Configure digital switch pins as input pullup
+    digital_configure_pin(DD_PIN_PB10, DD_CFG_INPUT_PULLUP);  //for left side
+    digital_configure_pin(DD_PIN_PB11, DD_CFG_INPUT_PULLUP);  //for right side
+
+  //Creation of tasks
+    xTaskCreate(vTarget,"Target",256,NULL,1,&xTargetDetection); //task for target detection
+    xTaskCreate(vDetObs,"Obstacle",256,NULL,1,&xObstacleDetection); //task for obstacle detection
+
+  //Start scheduler at this point
+  vTaskStartScheduler();
+
+  //To keep main function running
+  for(;;)
+
+  return 0;
+}
+
+
+
+//:::::::::::::::::::::::Task definitions:::::::::::::::::::::
+
+//the following task ensures that the Rover is able to detect and avoid the obstacles.
+
+void vDetObs(void *pvParameters)
+{
+
+//to suspend target detection task until target is found
+  vTaskSuspend( xTargetDetection );
+
+  for(;;)
+  {
+    //to obtain adc values from obstacle distance sensor
+  dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+    dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+
+  // To check the status of digital switch
+    SwitchChk_Obstacle();
+
+
+  // enters this if there is no obstacle ahead
+    if(((dSen_l <=Sensor_Threshold) && (dSen_r <=Sensor_Threshold)))
+    {
+      Forward();
+      SwitchChk_Obstacle();
+      corner_avoidance = 0.8;
+      dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+      dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+      getsample_a();
+      getsample_b();
+
+      if ((sample_value_a > 50) || (sample_value_b > 50))
+        {
+        FW_Speed = 60;
+        Turn_Speed = 60;
+        Sensor_Threshold = 1650;
+      //switching of tasks
+          vTaskResume( xTargetDetection );
+          vTaskSuspend( xObstacleDetection );
+        }
+            else
+        {
+          vTaskSuspend( xTargetDetection );
+        }
+    }
+
+  // enters this if there is obstacle straight ahead within the "Sensor Threshold"
+    else if(((dSen_l>(Sensor_Threshold-100)) &&(dSen_r>(Sensor_Threshold-100))))
+    {
+
+      if(dSen_r>dSen_l)
+      {
+        FullStop();
+
+        RampLeft();
+        while(((dSen_l>(Sensor_Threshold-500)) &&(dSen_r>(Sensor_Threshold-500))))
+              {
+                TurnLeft();
+                SwitchChk_Obstacle();
+                dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+                dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+
+                delay(60);
+      }
+      }
+      if(dSen_l>dSen_r)
+      {
+        FullStop();
+
+        RampRight();
+        while(((dSen_l>(Sensor_Threshold-500)) &&(dSen_r>(Sensor_Threshold-500))))
+              {
+                TurnRight();
+                SwitchChk_Obstacle();
+                dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+                dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+
+                delay(65);
+              }
+      }
+      FullStop();
+      delay(0.5);
+    }
+
+  // enters this if there is obstacle on Right within the "Sensor Threshold"
+    else if(((dSen_l <Sensor_Threshold) &&(dSen_r>Sensor_Threshold)))
+    {
+      RampLeft();
+
+      while(((dSen_l <Sensor_Threshold) &&(dSen_r>Sensor_Threshold)))
+      {
+        TurnLeft();
+        SwitchChk_Obstacle();
+        dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+        dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+
+        delay(corner_avoidance);
+      }
+      FullStop();
+
+      corner_avoidance=corner_avoidance*8;
+    }
+
+  // enters this if there is obstacle on Left within the "Sensor Threshold"
+    else if(((dSen_l>Sensor_Threshold) &&(dSen_r<Sensor_Threshold)))
+    {
+      RampRight();
+
+      while(((dSen_l>Sensor_Threshold) &&(dSen_r<Sensor_Threshold)))
+      {
+        TurnRight();
+        SwitchChk_Obstacle();
+        dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+        dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+
+        delay(corner_avoidance);
+      }
+      FullStop();
+
+      corner_avoidance=corner_avoidance*10;
+    }
+  }
+}
+
+
+//the following task ensures that the Rover is able to detect the target and move towards it.
+
+void vTarget(void *pvParameters)
+{
+
+  for( ;; )
+  {
+    getsample_a();
+    getsample_b();
+
+    SwitchChk_Target();
+
+  // enters this if the is target is closer to the left side of the Rover's IR sensor
+    if ((sample_value_a > (sample_value_b+510))  && dSen_l < Sensor_Threshold && dSen_r < Sensor_Threshold)
+    {
+      RampLeft();
+
+            while((sample_value_a > (sample_value_b+510))  && dSen_l < Sensor_Threshold && dSen_r < Sensor_Threshold)
+            {
+        TurnLeft();
+        SwitchChk_Target();
+        getsample_a();
+        getsample_b();
+        dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+        dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+        //delay(0.5);
+            }
+            FullStop();
+            delay(0.5);
+      //switching of tasks
+            vTaskResume( xObstacleDetection );
+
+      vTaskSuspend( xTargetDetection );
+      corner_avoidance = 0.8;
+        }
+    // enters this if the is target is closer to the right side of the Rover's IR sensor
+        else if ((sample_value_b > (sample_value_a+510)) && dSen_l < Sensor_Threshold && dSen_r < Sensor_Threshold)
+    {
+      RampRight();
+
+            while((sample_value_b > (sample_value_a+510)) && dSen_l < Sensor_Threshold && dSen_r < Sensor_Threshold)
+            {
+        TurnRight();
+        SwitchChk_Target();
+        getsample_a();
+        getsample_b();
+        dSen_l=adc_get_value(DA_ADC_CHANNEL0);
+        dSen_r=adc_get_value(DA_ADC_CHANNEL1);
+        //delay(0.5);
+            }
+            FullStop();
+            delay(0.5);
+      //switching of tasks
+            vTaskResume( xObstacleDetection );
+
+            vTaskSuspend( xTargetDetection );
+            corner_avoidance = 0.8;
+        }
+    // enters this if the is target is straight ahead of Rover's both IR sensors
+        else
+        {
+      Forward();
+      corner_avoidance = 0.8;
+      SwitchChk_Target();
+
+    //switching of tasks
+            vTaskResume( xObstacleDetection );
+            vTaskSuspend( xTargetDetection );
+    }
+  }
+}
+
+//*****************************************************************************
+
+
+
+
+//::::::::::::::Funtion Definitions::::::::::::::::::::::::::
+
+// this is obstacle function that checks and performs task if the switch is pressed
+void SwitchChk_Obstacle()
+{
+  switch1 = digital_get_pin(DD_PIN_PB11);
+  switch2 = digital_get_pin(DD_PIN_PB10);
+
+  // enters this if the switches are pressed
+  if((switch1==0) || (switch2==0))
+  {
+    vTaskSuspend( xTargetDetection );
+
+  // enters this if the left switch is pressed
+    if((switch1==0))
+    {
+      Collision(1);
+    }
+
+  // enters this if the right switch is pressed
+    else
+    {
+      Collision(2);
+    }
+  }
+}
+
+// this is target function  that checks and performs task if the switch is pressed
+void SwitchChk_Target()
+{
+  switch1 = digital_get_pin(DD_PIN_PB11);
+  switch2 = digital_get_pin(DD_PIN_PB10);
+
+  // enters this if the switches are pressed
+  if((switch1==0) || (switch2==0))
+  {
+    vTaskSuspend( xObstacleDetection );
+
+  // enters this if the left switch is pressed
+    if((switch1==0))
+        {
+          Collision(1);
+        }
+    // enters this if the right switch is pressed
+        else
+        {
+          Collision(2);
+        }
+  }
+}
+
+//this function is called from SwitchChk functions to perform reverse movement on collision
+
+void Collision(int x)
+{
+  FullStop();
+  delay(5);
+  Reverse();
+  delay(800);
+  FullStop();
+  delay(5);
+  if (x==1)
+  {
+    TurnLeft();
+  }
+  else
+  {
+    TurnRight();
+  }
+  delay(400);
+  FullStop();
+  delay(5);
+  Forward();
+}
+
+
+//function linearly decreases the speed of the Rover and stops the Rover after checking "mot_status"
+void FullStop()
+{
+  if(mot_status == 0)
+  {
+
+  }
+  else if(mot_status == 5)
+  {
+    for( int i = FW_Speed; i>=0; i--)
+    {
+      motor_set(0, i);
+      motor_set(1, i);
+      motor_set(2, 0);
+      delay(2);
+    }
+    mot_status = 0;
+
+    //traces("Full Stop");
+  }
+  else if(mot_status == 1)
+  {
+    for( int i = Turn_Speed; i>=0; i--)
+    {
+      motor_set(0, -i);
+      motor_set(1, i);
+      motor_set(2, -i);
+      delay(2);
+    }
+    mot_status = 0;
+
+    //traces("Full Stop");
+  }
+  else if(mot_status == 2)
+  {
+    for( int i = Turn_Speed; i>=0; i--)
+    {
+      motor_set(0, i);
+      motor_set(1, -i);
+      motor_set(2, i);
+      delay(2);
+    }
+    mot_status = 0;
+
+    //traces("Full Stop");
+  }
+  else if(mot_status == 3)
+  {
+    for( int i = FW_Speed; i>=0; i--)
+    {
+      motor_set(0, -i);
+      motor_set(1, -i);
+      motor_set(2, 0);
+      delay(2);
+    }
+    mot_status = 0;
+
+    //traces("Full Stop");
+  }
+}
+
+
+//function linearly increases the speed of the Rover in forward direction after checking "mot_status"
+void Forward()
+{
+  if(mot_status == 0)
+  {
+    for (int i = 0; i<=FW_Speed; i++)
+    {
+      motor_set(0, i);
+      motor_set(1, i);
+      motor_set(2, 0);
+      delay(2);
+    }
+    //traces("Moving Forward");
+
+    mot_status = 5;
+  }
+  else if(mot_status == 5)
+  {
+    motor_set(0, FW_Speed);
+    motor_set(1, FW_Speed);
+    motor_set(2, 0);
+    //traces("Moving Forward");
+
+    mot_status = 5;
+  }
+  else if(mot_status == 1)
+  {
+    for( int i = Turn_Speed; i>=0; i--)
+    {
+      motor_set(0, -i);
+      motor_set(1, i);
+      motor_set(2, -i);
+      delay(2);
+    }
+    for (int i = 0; i<=FW_Speed; i++)
+    {
+      motor_set(0, i);
+      motor_set(1, i);
+      motor_set(2, 0);
+      delay(2);
+    }
+    //traces("Moving Forward");
+
+    mot_status = 5;
+  }
+  else if(mot_status == 2)
+  {
+    for( int i = Turn_Speed; i>=0; i--)
+    {
+      motor_set(0, i);
+      motor_set(1, -i);
+      motor_set(2, i);
+      delay(2);
+    }
+    for (int i = 0; i<=FW_Speed; i++)
+    {
+      motor_set(0, i);
+      motor_set(1, i);
+      motor_set(2, 0);
+      delay(2);
+    }
+    //traces("Moving Forward");
+
+    mot_status = 5;
+  }
+  else if(mot_status == 3)
+  {
+    for( int i = FW_Speed; i>=0; i--)
+    {
+      motor_set(0, -i);
+      motor_set(1, -i);
+      motor_set(2, 0);
+      delay(2);
+    }
+
+    for (int i = 0; i<=FW_Speed; i++)
+    {
+      motor_set(0, i);
+      motor_set(1, i);
+      motor_set(2, 0);
+      delay(2);
+    }
+    //traces("Moving Forward");
+
+    mot_status = 5;
+  }
+}
+
+//function linearly increases the speed of the Rover in left turning direction
+void RampLeft()
+{
+  for( int i = 0; i<=Turn_Speed; i++)
+  {
+    motor_set(0, -i);
+    motor_set(1, i);
+    motor_set(2, -i);
+    delay(2);
+  }
+    //traces("Turning Left");
+  mot_status = 1;
+}
+
+//function linearly increases the speed of the Rover in right turning direction
+void RampRight()
+{
+    for( int i = 0; i<=Turn_Speed; i++)
+  {
+    motor_set(0, i);
+    motor_set(1, -i);
+    motor_set(2, i);
+    delay(2);
+  }
+    //traces("Turning Right");
+  mot_status = 2;
+}
+
+//function keeps constant speed for turning left
+void TurnLeft()
+{
+    motor_set(0, -Turn_Speed);
+    motor_set(1, Turn_Speed);
+    motor_set(2, -Turn_Speed);
+
+    //traces("Turning Left");
+    mot_status = 1;
+}
+
+//function keeps constant speed for turning right
+void TurnRight()
+{
+    motor_set(0, Turn_Speed);
+    motor_set(1, -Turn_Speed);
+    motor_set(2, Turn_Speed);
+
+    //traces("Turning Right");
+    mot_status = 2;
+}
+
+
+
+//function increases the speed of the Rover in reverse direction
+void Reverse()
+{
+
+    for( int i = 0; i<=FW_Speed; i++)
+  {
+    motor_set(0, -i);
+    motor_set(1, -i);
+    motor_set(2, 0);
+    delay(2);
+  }
+    //traces("Reverse");
+
+  mot_status = 3;
+}
+
+//this function provides the sampled value from the left IR sensor
+void getsample_a()
+{
+
+  ft_start_sampling(DD_PIN_PE0);
+  ft_get_samples();
+  delay(50);
+  fft_sampling = ft_is_sampling_finished();
+
+  if (fft_sampling == true)
+  {
+    sample_value_a = ft_get_transform(DFT_FREQ100);
+  }
+}
+
+//this function provides the sampled value from the right IR sensor
+void getsample_b()
+{
+
+  ft_start_sampling(DD_PIN_PE1);
+  ft_get_samples();
+  delay(50);
+  fft_sampling = ft_is_sampling_finished();
+
+  if (fft_sampling == true)
+  {
+    sample_value_b = ft_get_transform(DFT_FREQ100);
+  }
+}
